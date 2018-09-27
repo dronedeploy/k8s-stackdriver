@@ -207,7 +207,7 @@ func (t *Translator) ListMetricDescriptors() *stackdriver.ProjectsMetricDescript
 		filter = joinFilters(t.legacyFilterForCluster(), t.legacyFilterForAnyPod())
 	}
 	return t.service.Projects.MetricDescriptors.
-		List(fmt.Sprintf("projects/%s", t.config.Project)).
+		List(fmt.Sprintf("projects/%s", t.config.SdProject)).
 		Filter(filter)
 }
 
@@ -231,7 +231,7 @@ func (t *Translator) GetMetricsFromSDDescriptorsResp(response *stackdriver.ListM
 
 // GetMetricKind returns metricKind for metric metricName, obtained from Stackdriver Monitoring API.
 func (t *Translator) GetMetricKind(metricName string) (string, error) {
-	response, err := t.service.Projects.MetricDescriptors.Get(fmt.Sprintf("projects/%s/metricDescriptors/%s", t.config.Project, metricName)).Do()
+	response, err := t.service.Projects.MetricDescriptors.Get(fmt.Sprintf("projects/%s/metricDescriptors/%s", t.config.SdProject, metricName)).Do()
 	if err != nil {
 		return "", provider.NewNoSuchMetricError(metricName, err)
 	}
@@ -298,7 +298,7 @@ func joinFilters(filters ...string) string {
 }
 
 func (t *Translator) filterForCluster() string {
-	projectFilter := fmt.Sprintf("resource.labels.project_id = %q", t.config.Project)
+	projectFilter := fmt.Sprintf("resource.labels.project_id = %q", t.config.SdProject)
 	clusterFilter := fmt.Sprintf("resource.labels.cluster_name = %q", t.config.Cluster)
 	locationFilter := fmt.Sprintf("resource.labels.location = %q", t.config.Location)
 	return fmt.Sprintf("%s AND %s AND %s", projectFilter, clusterFilter, locationFilter)
@@ -339,7 +339,7 @@ func (t *Translator) filterForNodes(nodeNames []string) string {
 }
 
 func (t *Translator) legacyFilterForCluster() string {
-	projectFilter := fmt.Sprintf("resource.labels.project_id = %q", t.config.Project)
+	projectFilter := fmt.Sprintf("resource.labels.project_id = %q", t.config.SdProject)
 	// Skip location, since it may be set incorrectly by Heapster for old resource model
 	clusterFilter := fmt.Sprintf("resource.labels.cluster_name = %q", t.config.Cluster)
 	containerFilter := "resource.labels.container_name = \"\""
@@ -441,7 +441,7 @@ func (t *Translator) getMetricLabels(series *stackdriver.TimeSeries) map[string]
 }
 
 func (t *Translator) createListTimeseriesRequest(filter string, metricKind string) *stackdriver.ProjectsTimeSeriesListCall {
-	project := fmt.Sprintf("projects/%s", t.config.Project)
+	project := fmt.Sprintf("projects/%s", t.config.SdProject)
 	endTime := t.clock.Now()
 	startTime := endTime.Add(-t.reqWindow)
 	// use "ALIGN_NEXT_OLDER" by default, i.e. for metricKind "GAUGE"

@@ -18,6 +18,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 
 	gce "cloud.google.com/go/compute/metadata"
 	"github.com/golang/glog"
@@ -26,10 +27,11 @@ import (
 
 // GceConfig aggregates all GCE related configuration parameters.
 type GceConfig struct {
-	Project  string
-	Location string
-	Cluster  string
-	Instance string
+	Project   string
+	SdProject string
+	Location  string
+	Cluster   string
+	Instance  string
 }
 
 // GetGceConfig builds GceConfig based on the provided prefix and metadata server available on GCE.
@@ -41,6 +43,11 @@ func GetGceConfig() (*GceConfig, error) {
 	project, err := gce.ProjectID()
 	if err != nil {
 		return nil, fmt.Errorf("error while getting project id: %v", err)
+	}
+
+	sdProject := os.Getenv("SD_PROJECT")
+	if sdProject == "" {
+		sdProject = project
 	}
 
 	location, err := gce.InstanceAttributeValue("cluster-location")
@@ -63,7 +70,8 @@ func GetGceConfig() (*GceConfig, error) {
 	}
 
 	return &GceConfig{
-		Project: project,
+		Project:   project,
+		SdProject: sdProject,
 		// Trim trailing '\n' from parameters obtained from instance attributes
 		Location: strings.TrimSpace(location),
 		Cluster:  strings.TrimSpace(cluster),
