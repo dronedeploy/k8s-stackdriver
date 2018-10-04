@@ -119,7 +119,11 @@ func (t *Translator) GetSDReqForNodes(nodeList *v1.NodeList, metricName string, 
 
 // GetExternalMetricRequest returns Stackdriver request for query for external metric.
 func (t *Translator) GetExternalMetricRequest(metricName string, metricKind string, metricSelector labels.Selector) (*stackdriver.ProjectsTimeSeriesListCall, error) {
-	metricProject := t.GetExternalMetricProject(metricSelector)
+	metricProject, err := t.GetExternalMetricProject(metricSelector)
+	if err != nil {
+		return nil, err
+	}
+
 	filterForMetric := t.filterForMetric(metricName)
 	if metricSelector.Empty() {
 		return t.createListTimeseriesRequest(filterForMetric, metricKind), nil
@@ -245,7 +249,6 @@ func (t *Translator) GetExternalMetricProject(metricSelector labels.Selector) (s
 	if !selectable {
 		return "", apierr.NewBadRequest(fmt.Sprintf("Label selector is impossible to match: %s", metricSelector))
 	}
-	filters := []string{}
 	for _, req := range requirements {
 		if req.Key() == "resource.labels.project_id" {
 			return req.Values().List()[0], nil
