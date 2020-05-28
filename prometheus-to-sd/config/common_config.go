@@ -17,6 +17,10 @@ limitations under the License.
 package config
 
 import (
+	"io/ioutil"
+	"net/url"
+	"strings"
+
 	dto "github.com/prometheus/client_model/go"
 )
 
@@ -70,8 +74,39 @@ func (p *podConfigImpl) GetPodInfo(labels []*dto.LabelPair) (containerName, podI
 // CommonConfig contains all required information about environment in which
 // prometheus-to-sd running and which component is monitored.
 type CommonConfig struct {
-	GceConfig           *GceConfig
-	SourceConfig        *SourceConfig
-	OmitComponentName   bool
-	DowncaseMetricNames bool
+	GceConfig                   *GceConfig
+	SourceConfig                *SourceConfig
+	OmitComponentName           bool
+	DowncaseMetricNames         bool
+	MonitoredResourceLabels     map[string]string
+	MonitoredResourceTypePrefix string
+}
+
+// AuthConfig contains authentication data for making requests to components.
+type AuthConfig struct {
+	Username string
+	Password string
+	Token    string
+}
+
+func parseAuthConfig(url url.URL) (*AuthConfig, error) {
+	values := url.Query()
+	authToken := values.Get("authToken")
+	authTokenFile := values.Get("authTokenFile")
+	authUsername := values.Get("authUsername")
+	authPassword := values.Get("authPassword")
+
+	if len(authToken) == 0 && len(authTokenFile) > 0 {
+		buff, err := ioutil.ReadFile(authTokenFile)
+		if err != nil {
+			return nil, err
+		}
+		authToken = strings.Trim(string(buff), " \n")
+	}
+
+	return &AuthConfig{
+		Username: authUsername,
+		Password: authPassword,
+		Token:    authToken,
+	}, nil
 }

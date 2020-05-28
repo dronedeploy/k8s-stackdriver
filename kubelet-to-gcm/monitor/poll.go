@@ -28,9 +28,10 @@ const maxTimeSeriesPerRequest = 200
 // SourceConfig is the set of data required to configure a kubernetes
 // data source (e.g., kubelet or kube-controller).
 type SourceConfig struct {
-	Zone, Project, Cluster, Host, Instance string
-	Port                                   uint
-	Resolution                             time.Duration
+	Zone, Project, Cluster, ClusterLocation, Host, Instance, InstanceID, SchemaPrefix string
+	MonitoredResourceLabels                                                           map[string]string
+	Port                                                                              uint
+	Resolution                                                                        time.Duration
 }
 
 // MetricsSource is an object that provides kubernetes metrics in
@@ -43,6 +44,7 @@ type MetricsSource interface {
 
 // Once polls the backend and puts the data to the given service one time.
 func Once(src MetricsSource, gcm *v3.Service) {
+	scrapeTimestamp := time.Now()
 	req, err := src.GetTimeSeriesReq()
 	if err != nil {
 		observeFailedScrape(src.Name())
@@ -67,6 +69,7 @@ func Once(src MetricsSource, gcm *v3.Service) {
 		}
 		log.V(4).Infof("Successfully wrote TimeSeries data for %s to GCM v3 API.", src.Name())
 		observeSuccessfullRequest(len(subReq.TimeSeries))
+		observeIngestionLatency(len(subReq.TimeSeries), time.Now().Sub(scrapeTimestamp).Seconds())
 	}
 }
 

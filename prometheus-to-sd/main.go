@@ -17,14 +17,20 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"expvar"
 	"flag"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/golang/glog"
-	"golang.org/x/net/context"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	v3 "google.golang.org/api/monitoring/v3"
@@ -32,7 +38,6 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-stackdriver/prometheus-to-sd/config"
 	"github.com/GoogleCloudPlatform/k8s-stackdriver/prometheus-to-sd/flags"
 	"github.com/GoogleCloudPlatform/k8s-stackdriver/prometheus-to-sd/translator"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
@@ -48,15 +53,31 @@ var (
 	source = flags.Uris{}
 	podId  = flag.String("pod-id", "machine",
 		"Name of the pod in which monitored component is running.")
+	nodeOverride = flag.String("node-name", "",
+		"Node name to use. If not set, defaults to value from GCE Metadata Server.")
 	namespaceId = flag.String("namespace-id", "",
 		"Namespace name of the pod in which monitored component is running.")
 	zoneOverride = flag.String("zone-override", "",
 		"Name of the zone to override the default one (in which component is running).")
-	monitoredResourceTypes = flag.String("monitored-resource-types", "gke_container",
-		"The monitored resource types to use, either the legacy 'gke_container', or the new 'k8s'")
+	clusterNameOverride = flag.String("cluster-name", "",
+		"Cluster name to use. If not set, defaults to value from GCE Metadata Server.")
+	clusterLocationOverride = flag.String("cluster-location", "",
+		"Cluster location to use. If not set, defaults to value from GCE Metadata Server.")
+	projectOverride = flag.String("project-id", "",
+		"GCP project to send metrics to. If not set, defaults to value from GCE Metadata Server.")
+	monitoredResourceTypePrefix = flag.String("monitored-resource-type-prefix", "", "MonitoredResource type prefix, to be appended by 'container', 'pod', and 'node'.")
+	monitoredResourceLabels     = flag.String("monitored-resource-labels", "", "Manually specified MonitoredResource labels. "+
+		"It is in URL parameter format, like 'A=B&C=D&E=F'. "+
+		"When this field is specified, 'monitored-resource-type-prefix' is also required. "+
+		"By default, Prometheus-to-sd will read from GCE metadata server to fetch project id, cluster name, cluster location, and instance id. So these fields are optional in this flag. "+
+		"If these values are specified in this flag, they will overwrite the value from GCE metadata server. "+
+		"To note: 'namespace-name', 'pod-name', and 'container-name' should not be provided in this flag and they will always be overwritten by values in other command line flags.")
 	omitComponentName = flag.Bool("omit-component-name", true,
 		"If metric name starts with the component name then this substring is removed to keep metric name shorter.")
-	debugPort      = flag.Uint("port", 6061, "Port on which debug information is exposed.")
+	metricsPort    = flag.Uint("port", 6061, "Port on which metrics are exposed.")
+	listenAddress  = flag.String("listen-address", "", "Interface on which  metrics are exposed.")
+	debugPort      = flag.Uint("debug-port", 16061, "Port on which debug information is exposed.")
+	debugAddress   = flag.String("debug-address", "localhost", "Interface on which debug information is exposed.")
 	dynamicSources = flags.Uris{}
 	scrapeInterval = flag.Duration("scrape-interval", 60*time.Second,
 		"The interval between metric scrapes. If there are multiple scrapes between two exports, the last present value is exported, even when missing from last scraping.")
@@ -64,19 +85,40 @@ var (
 		"The interval between metric exports. Can't be lower than --scrape-interval.")
 	downcaseMetricNames = flag.Bool("downcase-metric-names", false,
 		"If enabled, will downcase all metric names.")
+	delayedShutdownTimeout = flag.Duration("delayed-shutdown-timeout", 120*time.Second,
+		"Time to wait for the shutdown after receiving SIGTERM. 0 value means shutdown immediately, negative value results in ignoring signal."+
+			" Default value is 120 seconds.")
+	gceTokenURL  = flag.String("gce-token-url", "", "URL to be used to obtain GCE access token")
+	gceTokenBody = flag.String("gce-token-body", "", "HTTP request body to be used to obtain GCE access token")
 )
 
 func main() {
 	flag.Set("logtostderr", "true")
-	flag.Var(&source, "source", "source(s) to watch in [component-name]:http://host:port/path?whitelisted=a,b,c&podIdLabel=d&namespaceIdLabel=e&containerNameLabel=f&metricsPrefix=prefix format")
+	flag.Var(&source, "source", "source(s) to watch in [component-name]:[http|https]://host:port/path?whitelisted=a,b,c&podIdLabel=d&namespaceIdLabel=e&containerNameLabel=f&metricsPrefix=prefix&authToken=token&authUsername=user&authPassword=password format. Can be specified multiple times")
 	flag.Var(&dynamicSources, "dynamic-source",
-		`dynamic source(s) to watch in format: "[component-name]:http://:port/path?whitelisted=metric1,metric2&podIdLabel=label1&namespaceIdLabel=label2&containerNameLabel=label3&metricsPrefix=prefix". Dynamic sources are components (on the same node) discovered dynamically using the kubernetes api.`,
+		`dynamic source(s) to watch in format: "[component-name]:[http|https]://:port/path?whitelisted=metric1,metric2&podIdLabel=label1&namespaceIdLabel=label2&containerNameLabel=label3&metricsPrefix=prefix&authToken=token&authUsername=user&authPassword=password". Dynamic sources are components (on the same node) discovered dynamically using the kubernetes api.`,
 	)
 
 	defer glog.Flush()
 	flag.Parse()
 
-	gceConf, err := config.GetGceConfig(*zoneOverride, *monitoredResourceTypes)
+	if *delayedShutdownTimeout < 0 {
+		signal.Ignore(syscall.SIGTERM)
+	} else {
+		sigTermChannel := make(chan os.Signal, 1)
+		signal.Notify(sigTermChannel, syscall.SIGTERM)
+
+		go func() {
+			<-sigTermChannel
+			glog.Infof("SIGTERM has been received, Waiting %s before the shutdown.", delayedShutdownTimeout.String())
+
+			time.Sleep(*delayedShutdownTimeout)
+			glog.Info("Shutting down after receiving SIGTERM.")
+			os.Exit(0)
+		}()
+	}
+
+	gceConf, err := config.GetGceConfig(*projectOverride, *clusterNameOverride, *clusterLocationOverride, *zoneOverride, *nodeOverride)
 	if err != nil {
 		glog.Fatalf("Failed to get GCE config: %v", err)
 	}
@@ -85,12 +127,37 @@ func main() {
 	sourceConfigs := getSourceConfigs(*metricsPrefix, gceConf)
 	glog.Infof("Built the following source configs: %v", sourceConfigs)
 
+	monitoredResourceLabels := parseMonitoredResourceLabels(*monitoredResourceLabels)
+	if len(monitoredResourceLabels) > 0 {
+		if *monitoredResourceTypePrefix == "" {
+			glog.Fatalf("When 'monitored-resource-labels' is specified, 'monitored-resource-type-prefix' cannot be empty.")
+		}
+		glog.Infof("Monitored resource labels: %v", monitoredResourceLabels)
+	}
+
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
-		glog.Error(http.ListenAndServe(fmt.Sprintf(":%d", *debugPort), nil))
+		glog.Error(http.ListenAndServe(fmt.Sprintf("%s:%d", *listenAddress, *metricsPort), nil))
 	}()
 
-	client := oauth2.NewClient(context.Background(), google.ComputeTokenSource(""))
+	go func() {
+		glog.Error(http.ListenAndServe(fmt.Sprintf("%s:%d", *debugAddress, *debugPort), expvar.Handler()))
+	}()
+
+	var client *http.Client
+
+	if *gceTokenURL != "" {
+		client = oauth2.NewClient(context.Background(), config.NewAltTokenSource(*gceTokenURL, *gceTokenBody))
+	} else if *projectOverride != "" {
+		client, err = google.DefaultClient(context.Background(), "https://www.googleapis.com/auth/cloud-platform")
+		if err != nil {
+			glog.Fatalf("Error getting default credentials: %v", err)
+		}
+		glog.Infof("Created a client with the default credentials")
+	} else {
+		client = oauth2.NewClient(context.Background(), google.ComputeTokenSource(""))
+	}
+
 	stackdriverService, err := v3.New(client)
 	if *apioverride != "" {
 		stackdriverService.BasePath = *apioverride
@@ -112,7 +179,7 @@ func main() {
 		glog.V(4).Infof("Starting goroutine for %+v", sourceConfig)
 
 		// Pass sourceConfig as a parameter to avoid using the last sourceConfig by all goroutines.
-		go readAndPushDataToStackdriver(stackdriverService, gceConf, sourceConfig)
+		go readAndPushDataToStackdriver(stackdriverService, gceConf, sourceConfig, monitoredResourceLabels, *monitoredResourceTypePrefix)
 	}
 
 	// As worker goroutines work forever, block main thread as well.
@@ -120,7 +187,7 @@ func main() {
 }
 
 func getSourceConfigs(defaultMetricsPrefix string, gceConfig *config.GceConfig) []*config.SourceConfig {
-	glog.Info("Taking source configs from flags")
+	glog.Infof("Taking source configs from flags")
 	staticSourceConfigs := config.SourceConfigsFromFlags(source, podId, namespaceId, defaultMetricsPrefix)
 	glog.Info("Taking source configs from kubernetes api server")
 	dynamicSourceConfigs, err := config.SourceConfigsFromDynamicSources(gceConfig, []flags.Uri(dynamicSources))
@@ -130,13 +197,15 @@ func getSourceConfigs(defaultMetricsPrefix string, gceConfig *config.GceConfig) 
 	return append(staticSourceConfigs, dynamicSourceConfigs...)
 }
 
-func readAndPushDataToStackdriver(stackdriverService *v3.Service, gceConf *config.GceConfig, sourceConfig *config.SourceConfig) {
-	glog.Infof("Running prometheus-to-sd, monitored target is %s %v:%v", sourceConfig.Component, sourceConfig.Host, sourceConfig.Port)
+func readAndPushDataToStackdriver(stackdriverService *v3.Service, gceConf *config.GceConfig, sourceConfig *config.SourceConfig, monitoredResourceLabels map[string]string, prefix string) {
+	glog.Infof("Running prometheus-to-sd, monitored target is %s %s://%v:%v", sourceConfig.Component, sourceConfig.Protocol, sourceConfig.Host, sourceConfig.Port)
 	commonConfig := &config.CommonConfig{
-		GceConfig:           gceConf,
-		SourceConfig:        sourceConfig,
-		OmitComponentName:   *omitComponentName,
-		DowncaseMetricNames: *downcaseMetricNames,
+		GceConfig:                   gceConf,
+		SourceConfig:                sourceConfig,
+		OmitComponentName:           *omitComponentName,
+		DowncaseMetricNames:         *downcaseMetricNames,
+		MonitoredResourceLabels:     monitoredResourceLabels,
+		MonitoredResourceTypePrefix: prefix,
 	}
 	metricDescriptorCache := translator.NewMetricDescriptorCache(stackdriverService, commonConfig)
 	signal := time.After(0)
@@ -149,11 +218,11 @@ func readAndPushDataToStackdriver(stackdriverService *v3.Service, gceConf *confi
 		// road will jump to next iteration of the loop.
 		select {
 		case <-exportTicker:
-			ts, err := timeSeriesBuilder.Build()
+			ts, scrapeTimestamp, err := timeSeriesBuilder.Build()
 			if err != nil {
 				glog.Errorf("Could not build time series for component %v: %v", sourceConfig.Component, err)
 			} else {
-				translator.SendToStackdriver(stackdriverService, commonConfig, ts)
+				translator.SendToStackdriver(stackdriverService, commonConfig, ts, scrapeTimestamp)
 			}
 		default:
 		}
@@ -177,11 +246,27 @@ func readAndPushDataToStackdriver(stackdriverService *v3.Service, gceConf *confi
 			glog.V(4).Infof("Skipping %v component as there are no metric to expose.", sourceConfig.Component)
 			continue
 		}
+		scrapeTimestamp := time.Now()
 		metrics, err := translator.GetPrometheusMetrics(sourceConfig)
 		if err != nil {
 			glog.V(2).Infof("Error while getting Prometheus metrics %v for component %v", err, sourceConfig.Component)
 			continue
 		}
-		timeSeriesBuilder.Update(metrics, time.Now())
+		timeSeriesBuilder.Update(metrics, scrapeTimestamp)
 	}
+}
+
+func parseMonitoredResourceLabels(monitoredResourceLabelsStr string) map[string]string {
+	labels := make(map[string]string)
+	m, err := url.ParseQuery(monitoredResourceLabelsStr)
+	if err != nil {
+		glog.Fatalf("Error parsing 'monitored-resource-labels' field: '%v', with error message: '%s'.", monitoredResourceLabelsStr, err)
+	}
+	for k, v := range m {
+		if len(v) != 1 {
+			glog.Fatalf("Key '%v' in 'monitored-resource-labels' doesn't have exactly one value (it has '%v' now).", k, v)
+		}
+		labels[k] = v[0]
+	}
+	return labels
 }

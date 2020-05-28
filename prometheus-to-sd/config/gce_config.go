@@ -21,46 +21,89 @@ import (
 	"strings"
 
 	gce "cloud.google.com/go/compute/metadata"
+	"github.com/golang/glog"
 )
 
 // GceConfig aggregates all GCE related configuration parameters.
 type GceConfig struct {
-	Project                string
-	Zone                   string
-	Cluster                string
-	ClusterLocation        string
-	Instance               string
-	MonitoredResourceTypes string
+	Project         string
+	Zone            string
+	Cluster         string
+	ClusterLocation string
+	// This is actually instance name.
+	Instance   string
+	InstanceId string
 }
 
 // GetGceConfig builds GceConfig based on the provided prefix and metadata server available on GCE.
-func GetGceConfig(zone string, monitoredResourceTypes string) (*GceConfig, error) {
+func GetGceConfig(project, cluster, clusterLocation, zone, node string) (*GceConfig, error) {
+	if project != "" {
+		glog.Infof("Using metadata all from flags")
+		if cluster == "" {
+			glog.Warning("Cluster name was not set. This can be set with --cluster-name")
+		}
+		if clusterLocation == "" {
+			glog.Warning("Cluster location was not set. This can be set with --cluster-location")
+		}
+		if zone == "" {
+			// zone is only used by the older gke_container
+			glog.Info("Zone was not set. This can be set with --zone-override")
+		}
+		if node == "" {
+			glog.Warning("Node was not set. This can be set with --node-name")
+		}
+		return &GceConfig{
+			Project:         project,
+			Zone:            zone,
+			Cluster:         cluster,
+			ClusterLocation: clusterLocation,
+			Instance:        node,
+		}, nil
+	}
+
 	if !gce.OnGCE() {
 		return nil, fmt.Errorf("Not running on GCE.")
 	}
 
-	project, err := gce.ProjectID()
-	if err != nil {
-		return nil, fmt.Errorf("error while getting project id: %v", err)
+	var err error
+	if project == "" {
+		project, err = gce.ProjectID()
+		if err != nil {
+			return nil, fmt.Errorf("error while getting project id: %v", err)
+		}
 	}
 
-	cluster, err := gce.InstanceAttributeValue("cluster-name")
-	if err != nil {
-		return nil, fmt.Errorf("error while getting cluster name: %v", err)
-	}
-	cluster = strings.TrimSpace(cluster)
 	if cluster == "" {
-		return nil, fmt.Errorf("cluster-name metadata was empty")
+		cluster, err = gce.InstanceAttributeValue("cluster-name")
+		if err != nil {
+			return nil, fmt.Errorf("error while getting cluster name: %v", err)
+		}
+		cluster = strings.TrimSpace(cluster)
+		if cluster == "" {
+			return nil, fmt.Errorf("cluster-name metadata was empty")
+		}
 	}
 
-	instance, err := gce.InstanceName()
+	if node == "" {
+		node, err = gce.InstanceName()
+		if err != nil {
+			return nil, fmt.Errorf("error while getting instance (node) name: %v", err)
+		}
+	}
+
+	instanceId, err := gce.InstanceID()
 	if err != nil {
-		return nil, fmt.Errorf("error while getting instance name: %v", err)
+		return nil, fmt.Errorf("error while getting instance id: %v", err)
 	}
 
-	var clusterLocation string
-	switch monitoredResourceTypes {
-	case "k8s":
+	if zone == "" {
+		zone, err = gce.Zone()
+		if err != nil {
+			return nil, fmt.Errorf("error while getting zone: %v", err)
+		}
+	}
+
+	if clusterLocation == "" {
 		clusterLocation, err = gce.InstanceAttributeValue("cluster-location")
 		if err != nil {
 			return nil, fmt.Errorf("error while getting cluster location: %v", err)
@@ -69,23 +112,14 @@ func GetGceConfig(zone string, monitoredResourceTypes string) (*GceConfig, error
 		if clusterLocation == "" {
 			return nil, fmt.Errorf("cluster-location metadata was empty")
 		}
-	case "gke_container":
-		if zone == "" {
-			zone, err = gce.Zone()
-			if err != nil {
-				return nil, fmt.Errorf("error while getting zone: %v", err)
-			}
-		}
-	default:
-		return nil, fmt.Errorf("Unsupported resource types used: '%s'", monitoredResourceTypes)
 	}
 
 	return &GceConfig{
-		Project:                project,
-		Zone:                   zone,
-		Cluster:                cluster,
-		ClusterLocation:        clusterLocation,
-		Instance:               instance,
-		MonitoredResourceTypes: monitoredResourceTypes,
+		Project:         project,
+		Zone:            zone,
+		Cluster:         cluster,
+		ClusterLocation: clusterLocation,
+		Instance:        node,
+		InstanceId:      instanceId,
 	}, nil
 }

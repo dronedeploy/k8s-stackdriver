@@ -6,12 +6,17 @@ import (
 
 	"github.com/GoogleCloudPlatform/k8s-stackdriver/prometheus-to-sd/flags"
 	"github.com/stretchr/testify/assert"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestMapToSourceConfig(t *testing.T) {
 	podName := "pod-name"
 	podNamespace := "pod-namespace"
+	emptyAuthConfig := AuthConfig{}
+	tokenAuthConfig := AuthConfig{Token: "token"}
+	userAuthConfig := AuthConfig{Username: "user", Password: "password"}
+	emptyWhitelistedLabelsMap := make(map[string]map[string]bool)
+
 	testcases := []struct {
 		componentName string
 		url           url.URL
@@ -22,46 +27,78 @@ func TestMapToSourceConfig(t *testing.T) {
 	}{
 		{
 			componentName: "kube-proxy",
-			url:           url.URL{Host: ":8080"},
+			url:           url.URL{Scheme: "https", Host: ":8080"},
 			ip:            "10.25.78.143",
 			podName:       podName,
 			podNamespace:  podNamespace,
 			want: SourceConfig{
-				Component: "kube-proxy",
-				Host:      "10.25.78.143",
-				Port:      uint(8080),
-				Path:      defaultMetricsPath,
-				PodConfig: NewPodConfig(podName, podNamespace, "", "", ""),
+				Component:            "kube-proxy",
+				Protocol:             "https",
+				Host:                 "10.25.78.143",
+				Port:                 uint(8080),
+				Path:                 defaultMetricsPath,
+				AuthConfig:           emptyAuthConfig,
+				PodConfig:            NewPodConfig(podName, podNamespace, "", "", ""),
+				WhitelistedLabelsMap: emptyWhitelistedLabelsMap,
+				CustomLabels:         map[string]string{},
 			},
 		},
 		{
 			componentName: "fluentd",
-			url:           url.URL{Host: ":80", RawQuery: "whitelisted=metric1,metric2"},
+			url:           url.URL{Scheme: "http", Host: ":80", RawQuery: "whitelisted=metric1,metric2&authToken=token"},
 			ip:            "very_important_ip",
 			podName:       podName,
 			podNamespace:  podNamespace,
 			want: SourceConfig{
-				Component:   "fluentd",
-				Host:        "very_important_ip",
-				Port:        uint(80),
-				Path:        defaultMetricsPath,
-				Whitelisted: []string{"metric1", "metric2"},
-				PodConfig:   NewPodConfig(podName, podNamespace, "", "", ""),
+				Component:            "fluentd",
+				Protocol:             "http",
+				Host:                 "very_important_ip",
+				Port:                 uint(80),
+				Path:                 defaultMetricsPath,
+				AuthConfig:           tokenAuthConfig,
+				Whitelisted:          []string{"metric1", "metric2"},
+				PodConfig:            NewPodConfig(podName, podNamespace, "", "", ""),
+				WhitelistedLabelsMap: emptyWhitelistedLabelsMap,
+				CustomLabels:         map[string]string{},
 			},
 		},
 		{
 			componentName: "cadvisor",
-			url:           url.URL{Host: ":8080", RawQuery: "whitelisted=metric1,metric2&podIdLabel=pod-id&namespaceIdLabel=namespace-id&containerNamelabel=container-name"},
+			url:           url.URL{Scheme: "http", Host: ":8080", RawQuery: "whitelisted=metric1,metric2&podIdLabel=pod-id&namespaceIdLabel=namespace-id&containerNamelabel=container-name&authUsername=user&authPassword=password"},
+			ip:            "very_important_ip",
+			podName:       podName,
+			podNamespace:  podNamespace,
+			want: SourceConfig{
+				Component:            "cadvisor",
+				Protocol:             "http",
+				Host:                 "very_important_ip",
+				Port:                 uint(8080),
+				Path:                 defaultMetricsPath,
+				AuthConfig:           userAuthConfig,
+				Whitelisted:          []string{"metric1", "metric2"},
+				PodConfig:            NewPodConfig(podName, podNamespace, "pod-id", "namespace-id", "container-name"),
+				WhitelistedLabelsMap: emptyWhitelistedLabelsMap,
+				CustomLabels:         map[string]string{},
+			},
+		},
+		{
+			componentName: "cadvisor",
+			url:           url.URL{Host: ":8080", RawQuery: "whitelisted=metric1,metric2&podIdLabel=pod-id&namespaceIdLabel=namespace-id&containerNamelabel=id&whitelistedLabels=containerNameLabel:/system.slice/node-problem-detector.service"},
 			ip:            "very_important_ip",
 			podName:       podName,
 			podNamespace:  podNamespace,
 			want: SourceConfig{
 				Component:   "cadvisor",
+				Protocol:    "http",
 				Host:        "very_important_ip",
 				Port:        uint(8080),
 				Path:        defaultMetricsPath,
 				Whitelisted: []string{"metric1", "metric2"},
-				PodConfig:   NewPodConfig(podName, podNamespace, "pod-id", "namespace-id", "container-name"),
+				PodConfig:   NewPodConfig(podName, podNamespace, "pod-id", "namespace-id", "id"),
+				WhitelistedLabelsMap: map[string]map[string]bool{
+					"containerNameLabel": {"/system.slice/node-problem-detector.service": true},
+				},
+				CustomLabels: map[string]string{},
 			},
 		},
 	}
@@ -131,56 +168,56 @@ func TestValidateSources(t *testing.T) {
 		},
 		{
 			sources: flags.Uris{
-				{Key: "component-name", Val: url.URL{Host: ":80"}},
+				{Key: "component-name", Val: url.URL{Scheme: "http", Host: ":80"}},
 			},
 			want: map[string]url.URL{
-				"component-name": {Host: ":80"},
+				"component-name": {Scheme: "http", Host: ":80"},
 			},
 			wantError: false,
 		},
 		{
 			sources: flags.Uris{
-				{Key: "component-name", Val: url.URL{Host: "hostname:80"}},
+				{Key: "component-name", Val: url.URL{Scheme: "http", Host: "hostname:80"}},
 			},
 			wantError: true,
 		},
 		{
 			sources: flags.Uris{
-				{Key: "component-name1", Val: url.URL{Host: ":80"}},
-				{Key: "component-name2", Val: url.URL{Host: "hostname:80"}},
+				{Key: "component-name1", Val: url.URL{Scheme: "http", Host: ":80"}},
+				{Key: "component-name2", Val: url.URL{Scheme: "http", Host: "hostname:80"}},
 			},
 			wantError: true,
 		},
 		{
 			sources: flags.Uris{
-				{Key: "component-name1", Val: url.URL{Host: "10.67.86.43:80"}},
-				{Key: "component-name2", Val: url.URL{Host: ":80"}},
+				{Key: "component-name1", Val: url.URL{Scheme: "http", Host: "10.67.86.43:80"}},
+				{Key: "component-name2", Val: url.URL{Scheme: "http", Host: ":80"}},
 			},
 			wantError: true,
 		},
 		{
 			sources: flags.Uris{
-				{Key: "component-name1", Val: url.URL{Host: ":80"}},
-				{Key: "component-name2", Val: url.URL{Host: ":81"}},
+				{Key: "component-name1", Val: url.URL{Scheme: "http", Host: ":80"}},
+				{Key: "component-name2", Val: url.URL{Scheme: "http", Host: ":81"}},
 			},
 			want: map[string]url.URL{
-				"component-name1": {Host: ":80"},
-				"component-name2": {Host: ":81"},
+				"component-name1": {Scheme: "http", Host: ":80"},
+				"component-name2": {Scheme: "http", Host: ":81"},
 			},
 			wantError: false,
 		},
 		{
 			sources: flags.Uris{
-				{Key: "component-name1", Val: url.URL{Host: ":80"}},
-				{Key: "component-name1", Val: url.URL{Host: ":81"}},
+				{Key: "component-name1", Val: url.URL{Scheme: "http", Host: ":80"}},
+				{Key: "component-name1", Val: url.URL{Scheme: "http", Host: ":81"}},
 			},
 			want:      map[string]url.URL{},
 			wantError: true,
 		},
 		{
 			sources: flags.Uris{
-				{Key: "component-name1", Val: url.URL{Host: ":80"}},
-				{Key: "component-name1", Val: url.URL{Host: ":80"}},
+				{Key: "component-name1", Val: url.URL{Scheme: "http", Host: ":80"}},
+				{Key: "component-name1", Val: url.URL{Scheme: "http", Host: ":80"}},
 			},
 			want:      map[string]url.URL{},
 			wantError: true,

@@ -19,13 +19,13 @@ BINARY_NAME = event-exporter
 
 PREFIX = staging-k8s.gcr.io
 IMAGE_NAME = event-exporter
-TAG = v0.2.4
+TAG = v0.3.1
 
 build:
-	${ENVVAR} go build -a -o ${BINARY_NAME}
+	${ENVVAR} go build -mod=vendor -a -o ${BINARY_NAME}
 
 test:
-	${ENVVAR} go test ./...
+	${ENVVAR} go test -mod=vendor ./...
 
 container:
 	docker build --pull -t ${PREFIX}/${IMAGE_NAME}:${TAG} .

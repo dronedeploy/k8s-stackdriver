@@ -38,6 +38,7 @@ var supportedMetricTypes = map[dto.MetricType]bool{
 	dto.MetricType_COUNTER:   true,
 	dto.MetricType_GAUGE:     true,
 	dto.MetricType_HISTOGRAM: true,
+	dto.MetricType_UNTYPED:   true,
 }
 
 const falseValueEpsilon = 0.001
@@ -69,20 +70,21 @@ func (t *TimeSeriesBuilder) Update(batch *PrometheusResponse, timestamp time.Tim
 }
 
 // Build returns a new TimeSeries array and restarts the internal state.
-func (t *TimeSeriesBuilder) Build() ([]*v3.TimeSeries, error) {
+func (t *TimeSeriesBuilder) Build() ([]*v3.TimeSeries, time.Time, error) {
 	var ts []*v3.TimeSeries
 	if t.batch == nil {
-		return ts, nil
+		return ts, time.Now(), nil
 	}
 	defer func() { t.batch = nil }()
 	metricFamilies, err := t.batch.metrics.Build(t.config, t.cache)
 	if err != nil {
-		return ts, err
+		return ts, time.Now(), err
 	}
 	// Get start time before whitelisting, because process start time
 	// metric is likely not to be whitelisted.
-	startTime := getStartTime(metricFamilies)
-	metricFamilies = filterWhitelisted(metricFamilies, t.config.SourceConfig.Whitelisted)
+	startTime := t.getStartTime(metricFamilies)
+	metricFamilies = filterWhitelistedMetrics(metricFamilies, t.config.SourceConfig.Whitelisted)
+	metricFamilies = filterWhitelistedLabels(metricFamilies, t.config.SourceConfig.WhitelistedLabelsMap)
 
 	for name, metric := range metricFamilies {
 		if t.cache.IsMetricBroken(name) {
@@ -95,7 +97,7 @@ func (t *TimeSeriesBuilder) Build() ([]*v3.TimeSeries, error) {
 			ts = append(ts, f...)
 		}
 	}
-	return ts, nil
+	return ts, t.batch.timestamp, nil
 }
 
 // OmitComponentName removes from the metric names prefix that is equal to component name.
@@ -185,7 +187,7 @@ func countMetricFromSummary(name string, metrics []*dto.Metric) *dto.MetricFamil
 	}
 }
 
-func getStartTime(metrics map[string]*dto.MetricFamily) time.Time {
+func (t *TimeSeriesBuilder) getStartTime(metrics map[string]*dto.MetricFamily) time.Time {
 	// For cumulative metrics we need to know process start time.
 	// If the process start time is not specified, assuming it's
 	// the unix 1 second, because Stackdriver can't handle
@@ -196,12 +198,12 @@ func getStartTime(metrics map[string]*dto.MetricFamily) time.Time {
 		startTime = time.Unix(int64(*startSec), 0)
 		glog.V(4).Infof("Monitored process start time: %v", startTime)
 	} else {
-		glog.Warningf("Metric %s invalid or not defined. Using %v instead. Cumulative metrics might be inaccurate.", processStartTimeMetric, startTime)
+		glog.Warningf("Metric %s invalid or not defined for component %s. Using %v instead. Cumulative metrics might be inaccurate.", processStartTimeMetric, t.config.SourceConfig.Component, startTime)
 	}
 	return startTime
 }
 
-func filterWhitelisted(allMetrics map[string]*dto.MetricFamily, whitelisted []string) map[string]*dto.MetricFamily {
+func filterWhitelistedMetrics(allMetrics map[string]*dto.MetricFamily, whitelisted []string) map[string]*dto.MetricFamily {
 	if len(whitelisted) == 0 {
 		return allMetrics
 	}
@@ -212,6 +214,37 @@ func filterWhitelisted(allMetrics map[string]*dto.MetricFamily, whitelisted []st
 			res[w] = family
 		} else {
 			glog.V(3).Infof("Whitelisted metric %s not present in Prometheus endpoint.", w)
+		}
+	}
+	return res
+}
+
+func filterWhitelistedLabels(allMetrics map[string]*dto.MetricFamily, whitelistedLabelsMap map[string]map[string]bool) map[string]*dto.MetricFamily {
+	if len(whitelistedLabelsMap) == 0 {
+		return allMetrics
+	}
+	glog.V(4).Infof("Exporting only whitelisted label values: %v", whitelistedLabelsMap)
+	res := map[string]*dto.MetricFamily{}
+	for metricName, metricFamily := range allMetrics {
+		var filteredMetrics []*dto.Metric
+		for _, metric := range metricFamily.Metric {
+			labels := metric.GetLabel()
+			for _, label := range labels {
+				if whitelistedLabelValues, found := whitelistedLabelsMap[*label.Name]; found && whitelistedLabelValues[*label.Value] {
+					filteredMetrics = append(filteredMetrics, metric)
+				}
+			}
+		}
+
+		if len(filteredMetrics) > 0 {
+			res[metricName] = &dto.MetricFamily{
+				Name:   metricFamily.Name,
+				Help:   metricFamily.Help,
+				Type:   metricFamily.Type,
+				Metric: filteredMetrics,
+			}
+		} else {
+			glog.V(3).Infof("Whitelisted label values for metric %s not found in Prometheus endpoint.", metricFamily)
 		}
 	}
 	return res
@@ -268,6 +301,8 @@ func translateOne(config *config.CommonConfig,
 	}
 	setValue(mType, valueType, metric, point)
 
+	mr := getMonitoredResourceFromLabels(config, metric.GetLabel())
+	glog.V(4).Infof("MonitoredResource to write: %v", mr)
 	return &v3.TimeSeries{
 		Metric: &v3.Metric{
 			Labels: getMetricLabels(config, metric.GetLabel()),
@@ -286,6 +321,8 @@ func setValue(mType dto.MetricType, valueType string, metric *dto.Metric, point 
 	} else if mType == dto.MetricType_HISTOGRAM {
 		point.Value.DistributionValue = convertToDistributionValue(metric.GetHistogram())
 		point.ForceSendFields = append(point.ForceSendFields, "DistributionValue")
+	} else if mType == dto.MetricType_UNTYPED {
+		setValueBaseOnSimpleType(metric.GetUntyped().GetValue(), valueType, point)
 	} else {
 		setValueBaseOnSimpleType(metric.GetCounter().GetValue(), valueType, point)
 	}
@@ -339,8 +376,8 @@ func convertToDistributionValue(h *dto.Histogram) *v3.Distribution {
 	}
 
 	return &v3.Distribution{
-		Count: count,
-		Mean:  mean,
+		Count:                 count,
+		Mean:                  mean,
 		SumOfSquaredDeviation: dev,
 		BucketOptions: &v3.BucketOptions{
 			ExplicitBuckets: &v3.Explicit{
@@ -391,6 +428,9 @@ func extractValueType(mType dto.MetricType, originalDescriptor *v3.MetricDescrip
 	if mType == dto.MetricType_HISTOGRAM {
 		return "DISTRIBUTION"
 	}
+	if mType == dto.MetricType_UNTYPED {
+		return "DOUBLE"
+	}
 	return "INT64"
 }
 
@@ -423,34 +463,13 @@ func createProjectName(config *config.GceConfig) string {
 }
 
 func getMonitoredResourceFromLabels(config *config.CommonConfig, labels []*dto.LabelPair) *v3.MonitoredResource {
+	if config.SourceConfig.CustomResourceType != "" {
+		return getCustomMonitoredResource(config)
+	}
 	container, pod, namespace := config.SourceConfig.PodConfig.GetPodInfo(labels)
+	prefix := config.MonitoredResourceTypePrefix
 
-	switch config.GceConfig.MonitoredResourceTypes {
-	case "k8s":
-		if namespace == "" && pod == "" && container == "machine" {
-			return &v3.MonitoredResource{
-				Type: "k8s_node",
-				Labels: map[string]string{
-					"project_id":   config.GceConfig.Project,
-					"location":     config.GceConfig.ClusterLocation,
-					"cluster_name": config.GceConfig.Cluster,
-					"node_name":    config.GceConfig.Instance,
-				},
-			}
-		}
-
-		return &v3.MonitoredResource{
-			Type: "k8s_container",
-			Labels: map[string]string{
-				"project_id":     config.GceConfig.Project,
-				"location":       config.GceConfig.ClusterLocation,
-				"cluster_name":   config.GceConfig.Cluster,
-				"namespace_name": namespace,
-				"pod_name":       pod,
-				"container_name": container,
-			},
-		}
-	case "gke_container":
+	if prefix == "" {
 		return &v3.MonitoredResource{
 			Type: "gke_container",
 			Labels: map[string]string{
@@ -465,5 +484,72 @@ func getMonitoredResourceFromLabels(config *config.CommonConfig, labels []*dto.L
 		}
 	}
 
-	return nil
+	resourceLabels := make(map[string]string)
+	for k, v := range config.MonitoredResourceLabels {
+		resourceLabels[k] = v
+	}
+	if _, found := resourceLabels["project_id"]; !found {
+		resourceLabels["project_id"] = config.GceConfig.Project
+	}
+	if _, found := resourceLabels["cluster_name"]; !found {
+		resourceLabels["cluster_name"] = config.GceConfig.Cluster
+	}
+	if _, found := resourceLabels["location"]; !found {
+		resourceLabels["location"] = config.GceConfig.ClusterLocation
+	}
+
+	// When MonitoredResource type is not "k8s_*", default "instance_id" label to GCE instance name.
+	if prefix != "k8s_" {
+		if _, found := resourceLabels["instance_id"]; !found {
+			resourceLabels["instance_id"] = config.GceConfig.InstanceId
+		}
+	}
+
+	// When namespace and pod are unspecified, it should be written to node type.
+	if namespace == "" || pod == "" || pod == "machine" {
+		// When MonitoredResource is "k8s_node", default "node_name" label to GCE instance name.
+		if prefix == "k8s_" {
+			if _, found := resourceLabels["node_name"]; !found {
+				resourceLabels["node_name"] = config.GceConfig.Instance
+			}
+		}
+		return &v3.MonitoredResource{
+			Type:   prefix + "node",
+			Labels: resourceLabels,
+		}
+	}
+
+	resourceLabels["namespace_name"] = namespace
+	resourceLabels["pod_name"] = pod
+	if container == "" {
+		return &v3.MonitoredResource{
+			Type:   prefix + "pod",
+			Labels: resourceLabels,
+		}
+	}
+
+	resourceLabels["container_name"] = container
+	return &v3.MonitoredResource{
+		Type:   prefix + "container",
+		Labels: resourceLabels,
+	}
+}
+
+func getCustomMonitoredResource(config *config.CommonConfig) *v3.MonitoredResource {
+	resourceLabels := config.SourceConfig.CustomLabels
+	applyDefaultIfEmpty(resourceLabels, "instance_id", config.GceConfig.InstanceId)
+	applyDefaultIfEmpty(resourceLabels, "project_id", config.GceConfig.Project)
+	applyDefaultIfEmpty(resourceLabels, "cluster_name", config.GceConfig.Cluster)
+	applyDefaultIfEmpty(resourceLabels, "location", config.GceConfig.ClusterLocation)
+	applyDefaultIfEmpty(resourceLabels, "node_name", config.GceConfig.Instance)
+	return &v3.MonitoredResource{
+		Type:   config.SourceConfig.CustomResourceType,
+		Labels: resourceLabels,
+	}
+}
+
+func applyDefaultIfEmpty(resourceLabels map[string]string, key, defaultValue string) {
+	if val, found := resourceLabels[key]; found && val == "" {
+		resourceLabels[key] = defaultValue
+	}
 }

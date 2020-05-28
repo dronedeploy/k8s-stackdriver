@@ -44,6 +44,7 @@ dep_projects=$(find "${CONTRIB_ROOT}" -wholename '*Gopkg.toml' -not -path "*/ven
 for dep_file in ${dep_projects}; do
   (
     project="${dep_file%Gopkg.toml}"
+
     echo "go ${CMD}ing ${project}"
     cd "${project}"
     go "${CMD}" ./...

@@ -50,7 +50,8 @@ func newSystemStopChannel() chan struct{} {
 		sig := <-c
 		glog.Infof("Received signal %s, terminating", sig.String())
 
-		ch <- struct{}{}
+		// Close stop channel to make sure every goroutine will receive stop signal.
+		close(ch)
 	}()
 
 	return ch
@@ -61,6 +62,8 @@ func newKubernetesClient() (kubernetes.Interface, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create in-cluster config: %v", err)
 	}
+	// Use protobufs for communication with apiserver.
+	config.ContentType = "application/vnd.kubernetes.protobuf"
 
 	return kubernetes.NewForConfig(config)
 }

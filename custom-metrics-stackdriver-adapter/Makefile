@@ -3,7 +3,7 @@ GOOS?=linux
 OUT_DIR?=build
 PACKAGE=github.com/GoogleCloudPlatform/k8s-stackdriver/custom-metrics-stackdriver-adapter
 PREFIX?=staging-k8s.gcr.io
-TAG = v0.9.0
+TAG = v0.10.2
 PKG := $(shell find pkg/* -type f)
 
 .PHONY: build docker push test clean
@@ -11,16 +11,16 @@ PKG := $(shell find pkg/* -type f)
 build: build/adapter
 
 build/adapter: adapter.go $(PKG)
-	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(ARCH) go build -a -o $(OUT_DIR)/$(ARCH)/adapter adapter.go
+	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(ARCH) go build -mod vendor -a -o $(OUT_DIR)/$(ARCH)/adapter adapter.go
 
-docker: build/adapter
+docker:
 	docker build --pull -t ${PREFIX}/custom-metrics-stackdriver-adapter:$(TAG) .
 
 push: docker
 	gcloud docker -- push ${PREFIX}/custom-metrics-stackdriver-adapter:$(TAG)
 
 test: $(PKG)
-	CGO_ENABLED=0 go test ./pkg/...
+	CGO_ENABLED=0 go test -mod vendor ./pkg/...
 
 clean:
 	rm -rf build

@@ -49,11 +49,10 @@ const epsilon = float64(0.001)
 
 var commonConfig = &config.CommonConfig{
 	GceConfig: &config.GceConfig{
-		Project:                "test-proj",
-		Zone:                   "us-central1-f",
-		Cluster:                "test-cluster",
-		Instance:               "kubernetes-master.c.test-proj.internal",
-		MonitoredResourceTypes: "gke_container",
+		Project:  "test-proj",
+		Zone:     "us-central1-f",
+		Cluster:  "test-cluster",
+		Instance: "kubernetes-master.c.test-proj.internal",
 	},
 	SourceConfig: &config.SourceConfig{
 		PodConfig:     config.NewPodConfig("machine", "", "", "", ""),
@@ -65,6 +64,7 @@ var commonConfig = &config.CommonConfig{
 var metricTypeGauge = dto.MetricType_GAUGE
 var metricTypeCounter = dto.MetricType_COUNTER
 var metricTypeHistogram = dto.MetricType_HISTOGRAM
+var metricTypeUntyped = dto.MetricType_UNTYPED
 
 var testMetricName = "test_name"
 var booleanMetricName = "boolean_metric"
@@ -75,11 +75,18 @@ var testMetricHistogram = "test_histogram"
 var unrelatedMetric = "unrelated_metric"
 var testMetricDescription = "Description 1"
 var testMetricHistogramDescription = "Description 2"
+var untypedMetricName = "untyped_metric"
+var testLabelName = "labelName"
+var testLabelValue1 = "labelValue1"
+var testLabelValue2 = "labelValue2"
+
+var now = time.Now()
 
 var metricsResponse = &PrometheusResponse{rawResponse: `
 # TYPE test_name counter
 test_name{labelName="labelValue1"} 42.0
 test_name{labelName="labelValue2"} 106.0
+test_name{labelName="labelValue3"} 136.0
 # TYPE boolean_metric gauge
 boolean_metric{labelName="falseValue"} 0.00001
 boolean_metric{labelName="trueValue"} 1.2
@@ -96,6 +103,8 @@ test_histogram_bucket{le="5.0"} 4
 test_histogram_bucket{le="+Inf"} 5
 test_histogram_sum 13.0
 test_histogram_count 5
+# TYPE untyped_metric untyped
+untyped_metric 98.6
 `,
 }
 
@@ -122,6 +131,15 @@ var metrics = map[string]*dto.MetricFamily{
 					},
 				},
 				Counter: &dto.Counter{Value: floatPtr(106.0)},
+			},
+			{
+				Label: []*dto.LabelPair{
+					{
+						Name:  stringPtr("labelName"),
+						Value: stringPtr("labelValue3"),
+					},
+				},
+				Counter: &dto.Counter{Value: floatPtr(136.0)},
 			},
 		},
 	},
@@ -207,6 +225,17 @@ var metrics = map[string]*dto.MetricFamily{
 			},
 		},
 	},
+	untypedMetricName: {
+		Name: &untypedMetricName,
+		Type: &metricTypeUntyped,
+		Metric: []*dto.Metric{
+			{
+				Untyped: &dto.Untyped{
+					Value: floatPtr(98.6),
+				},
+			},
+		},
+	},
 }
 
 var metricDescriptors = map[string]*v3.MetricDescriptor{
@@ -262,82 +291,261 @@ var metricDescriptors = map[string]*v3.MetricDescriptor{
 		MetricKind: "CUMULATIVE",
 		ValueType:  "INT64",
 	},
+	untypedMetricName: {
+		Type:       "container.googleapis.com/master/testcomponent/untyped_metric",
+		MetricKind: "GAUGE",
+		ValueType:  "DOUBLE",
+	},
 }
 
 func TestGetMonitoredResourceFromLabels(t *testing.T) {
 	testCases := []struct {
-		name     string
-		config   *config.CommonConfig
-		labels   []*dto.LabelPair
-		expected string
+		name           string
+		config         *config.CommonConfig
+		labels         []*dto.LabelPair
+		expectedType   string
+		expectedLabels map[string]string
 	}{
 		{
-			"Ensure that gke resources return gke_container.",
+			"Ensure that default returns gke_container.",
 			&config.CommonConfig{
 				GceConfig: &config.GceConfig{
-					MonitoredResourceTypes: "gke_container",
+					Project:    "test-project",
+					Zone:       "us-east1-a",
+					Cluster:    "test-cluster",
+					Instance:   "test-instance",
+					InstanceId: "123",
 				},
 				SourceConfig: &config.SourceConfig{
 					PodConfig: config.NewPodConfig("", "", "", "", ""),
 				},
+				MonitoredResourceLabels: map[string]string{},
 			},
 			nil,
 			"gke_container",
+			map[string]string{
+				"project_id":   "test-project",
+				"zone":         "us-east1-a",
+				"cluster_name": "test-cluster",
+				// To note: in legacy "gke_container" type, "instance_id" label referes to instance name.
+				"instance_id":    "test-instance",
+				"namespace_id":   "",
+				"pod_id":         "",
+				"container_name": "",
+			},
 		},
 		{
-			"Ensure that k8s resources with empty resource labels return k8s_container.",
+			"Ensure that k8s resources with 'machine' pod label return k8s_node.",
 			&config.CommonConfig{
-				GceConfig: &config.GceConfig{
-					MonitoredResourceTypes: "k8s",
-				},
+				GceConfig: &config.GceConfig{},
 				SourceConfig: &config.SourceConfig{
-					PodConfig: config.NewPodConfig("", "", "", "", ""),
+					PodConfig: config.NewPodConfig("machine", "", "", "", ""),
+				},
+				MonitoredResourceTypePrefix: "k8s_",
+				MonitoredResourceLabels: map[string]string{
+					"project_id":   "test-project",
+					"location":     "us-west1",
+					"cluster_name": "test-cluster",
+					"node_name":    "test-node",
 				},
 			},
 			nil,
-			"k8s_container",
-		},
-		{
-			"Ensure that k8s resources with non-machine resources return k8s_container.",
-			&config.CommonConfig{
-				GceConfig: &config.GceConfig{
-					MonitoredResourceTypes: "k8s",
-				},
-				SourceConfig: &config.SourceConfig{
-					PodConfig: config.NewPodConfig("nonEmptyPodID", "", "", "", "containerNameLabel"),
-				},
-			},
-			[]*dto.LabelPair{
-				{
-					Name:  stringPtr("containerNameLabel"),
-					Value: stringPtr("machine"),
-				},
-			},
-			"k8s_container",
-		},
-		{
-			"Ensure that k8s resources with machine resources return k8s_node.",
-			&config.CommonConfig{
-				GceConfig: &config.GceConfig{
-					MonitoredResourceTypes: "k8s",
-				},
-				SourceConfig: &config.SourceConfig{
-					PodConfig: config.NewPodConfig("", "", "", "", "containerNameLabel"),
-				},
-			},
-			[]*dto.LabelPair{
-				{
-					Name:  stringPtr("containerNameLabel"),
-					Value: stringPtr("machine"),
-				},
-			},
 			"k8s_node",
+			map[string]string{
+				"project_id":   "test-project",
+				"location":     "us-west1",
+				"cluster_name": "test-cluster",
+				"node_name":    "test-node",
+			},
+		},
+		{
+			"Ensure that k8s resources with 'machine' pod label return k8s_node, and can get default from GCE config..",
+			&config.CommonConfig{
+				GceConfig: &config.GceConfig{
+					Project:         "test-project",
+					Zone:            "us-east1-a",
+					Cluster:         "test-cluster",
+					ClusterLocation: "test-location",
+					Instance:        "test-instance",
+					InstanceId:      "123",
+				},
+				SourceConfig: &config.SourceConfig{
+					PodConfig: config.NewPodConfig("machine", "", "", "", ""),
+				},
+				MonitoredResourceTypePrefix: "k8s_",
+				MonitoredResourceLabels:     map[string]string{},
+			},
+			nil,
+			"k8s_node",
+			map[string]string{
+				"project_id":   "test-project",
+				"location":     "test-location",
+				"cluster_name": "test-cluster",
+				"node_name":    "test-instance",
+			},
+		},
+		{
+			"Ensure that k8s resources without container labels return k8s_pod.",
+			&config.CommonConfig{
+				GceConfig: &config.GceConfig{
+					Project:    "test-project",
+					Zone:       "us-east1-a",
+					Cluster:    "test-cluster",
+					Instance:   "test-instance",
+					InstanceId: "123",
+				},
+				SourceConfig: &config.SourceConfig{
+					PodConfig: config.NewPodConfig("test-pod", "test-namespace", "", "", ""),
+				},
+				MonitoredResourceTypePrefix: "k8s_",
+				MonitoredResourceLabels: map[string]string{
+					"project_id":   "test-project",
+					"location":     "us-west1",
+					"cluster_name": "test-cluster",
+				},
+			},
+			nil,
+			"k8s_pod",
+			map[string]string{
+				"project_id":     "test-project",
+				"location":       "us-west1",
+				"cluster_name":   "test-cluster",
+				"namespace_name": "test-namespace",
+				"pod_name":       "test-pod",
+			},
+		},
+		{
+			"Ensure that k8s resources with all labels return k8s_container.",
+			&config.CommonConfig{
+				GceConfig: &config.GceConfig{},
+				SourceConfig: &config.SourceConfig{
+					PodConfig: config.NewPodConfig("test-pod", "test-namespace", "", "", "containerNameLabel"),
+				},
+				MonitoredResourceTypePrefix: "k8s_",
+				MonitoredResourceLabels: map[string]string{
+					"project_id":   "test-project",
+					"location":     "us-west1",
+					"cluster_name": "test-cluster",
+				},
+			},
+			[]*dto.LabelPair{
+				{
+					Name:  stringPtr("containerNameLabel"),
+					Value: stringPtr("test-container"),
+				},
+			},
+			"k8s_container",
+			map[string]string{
+				"project_id":     "test-project",
+				"location":       "us-west1",
+				"cluster_name":   "test-cluster",
+				"namespace_name": "test-namespace",
+				"pod_name":       "test-pod",
+				"container_name": "test-container",
+			},
+		},
+		{
+			"Ensure that other resources with 'machine' pod label return node type.",
+			&config.CommonConfig{
+				GceConfig: &config.GceConfig{
+					Project:    "default-project",
+					Zone:       "us-east1-a",
+					Cluster:    "test-cluster",
+					Instance:   "default-instance",
+					InstanceId: "123",
+				},
+				SourceConfig: &config.SourceConfig{
+					PodConfig: config.NewPodConfig("machine", "", "", "", ""),
+				},
+				MonitoredResourceTypePrefix: "other_prefix_",
+				MonitoredResourceLabels: map[string]string{
+					"location":         "us-west1",
+					"cluster_name":     "test-cluster",
+					"additional_label": "foo",
+				},
+			},
+			nil,
+			"other_prefix_node",
+			map[string]string{
+				"project_id":       "default-project",
+				"location":         "us-west1",
+				"cluster_name":     "test-cluster",
+				"instance_id":      "123",
+				"additional_label": "foo",
+			},
+		},
+		{
+			"Allow source config resource type override",
+			&config.CommonConfig{
+				MonitoredResourceLabels: map[string]string{},
+				GceConfig: &config.GceConfig{
+					Project:    "default-project",
+					Zone:       "us-east1-a",
+					Cluster:    "test-cluster",
+					Instance:   "default-instance",
+					InstanceId: "123",
+				},
+				SourceConfig: &config.SourceConfig{
+					CustomResourceType: "resource_foo",
+					CustomLabels: map[string]string{
+						"foo": "bar",
+					},
+				},
+			},
+			nil,
+			"resource_foo",
+			map[string]string{
+				"foo": "bar",
+			},
+		},
+		{
+			"Ensure source config resource type override can default",
+			&config.CommonConfig{
+				MonitoredResourceLabels: map[string]string{},
+				GceConfig: &config.GceConfig{
+					Project:         "default-project",
+					Zone:            "us-east1-a",
+					Cluster:         "test-cluster",
+					ClusterLocation: "test-location",
+					Instance:        "default-instance",
+					InstanceId:      "123",
+				},
+				SourceConfig: &config.SourceConfig{
+					CustomResourceType: "resource_foo",
+					CustomLabels: map[string]string{
+						"foo":          "bar",
+						"baz":          "",
+						"project_id":   "",
+						"cluster_name": "",
+						"location":     "",
+						"instance_id":  "",
+						"node_name":    "",
+					},
+				},
+			},
+			nil,
+			"resource_foo",
+			map[string]string{
+				"foo":          "bar",
+				"baz":          "",
+				"project_id":   "default-project",
+				"cluster_name": "test-cluster",
+				"location":     "test-location",
+				"instance_id":  "123",
+				"node_name":    "default-instance",
+			},
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			originalResourceLabelsInConfig := make(map[string]string)
+			for k, v := range tc.config.MonitoredResourceLabels {
+				originalResourceLabelsInConfig[k] = v
+			}
 			monitoredResource := getMonitoredResourceFromLabels(tc.config, tc.labels)
-			assert.Equal(t, tc.expected, monitoredResource.Type)
+			assert.Equal(t, tc.expectedType, monitoredResource.Type)
+			assert.Equal(t, tc.expectedLabels, monitoredResource.Labels)
+			assert.Equal(t, originalResourceLabelsInConfig, tc.config.MonitoredResourceLabels)
 		})
 	}
 }
@@ -346,17 +554,18 @@ func TestTranslatePrometheusToStackdriver(t *testing.T) {
 	cache := buildCacheForTesting()
 
 	tsb := NewTimeSeriesBuilder(CommonConfigWithMetrics([]string{testMetricName, testMetricHistogram, booleanMetricName, floatMetricName}), cache)
-	tsb.Update(metricsResponse, time.Now())
-	ts, err := tsb.Build()
+	tsb.Update(metricsResponse, now)
+	ts, timestamp, err := tsb.Build()
+	assert.Equal(t, timestamp, now)
 
 	assert.Equal(t, err, nil)
 
-	assert.Equal(t, 6, len(ts))
+	assert.Equal(t, 7, len(ts))
 	// TranslatePrometheusToStackdriver uses maps to represent data, so order of output is randomized.
 	sort.Sort(ByMetricTypeReversed(ts))
 
-	// First two int values.
-	for i := 0; i <= 1; i++ {
+	// First three int values.
+	for i := 0; i <= 2; i++ {
 		metric := ts[i]
 		assert.Equal(t, "gke_container", metric.Resource.Type)
 		assert.Equal(t, "container.googleapis.com/master/testcomponent/test_name", metric.Metric.Type)
@@ -373,13 +582,15 @@ func TestTranslatePrometheusToStackdriver(t *testing.T) {
 			assert.Equal(t, int64(42), *(metric.Points[0].Value.Int64Value))
 		} else if labels["labelName"] == "labelValue2" {
 			assert.Equal(t, int64(106), *(metric.Points[0].Value.Int64Value))
+		} else if labels["labelName"] == "labelValue3" {
+			assert.Equal(t, int64(136), *(metric.Points[0].Value.Int64Value))
 		} else {
 			t.Errorf("Wrong label labelName value %s", labels["labelName"])
 		}
 	}
 
 	// Histogram
-	metric := ts[2]
+	metric := ts[3]
 	assert.Equal(t, "gke_container", metric.Resource.Type)
 	assert.Equal(t, "container.googleapis.com/master/testcomponent/test_histogram", metric.Metric.Type)
 	assert.Equal(t, "DISTRIBUTION", metric.ValueType)
@@ -408,7 +619,7 @@ func TestTranslatePrometheusToStackdriver(t *testing.T) {
 	assert.Equal(t, int64(1), counts[3])
 
 	// Then float value.
-	metric = ts[3]
+	metric = ts[4]
 	assert.Equal(t, "gke_container", metric.Resource.Type)
 	assert.Equal(t, "container.googleapis.com/master/testcomponent/float_metric", metric.Metric.Type)
 	assert.Equal(t, "DOUBLE", metric.ValueType)
@@ -418,7 +629,7 @@ func TestTranslatePrometheusToStackdriver(t *testing.T) {
 	assert.Equal(t, "2009-02-13T23:31:30Z", metric.Points[0].Interval.StartTime)
 
 	// Then two boolean values.
-	for i := 4; i <= 5; i++ {
+	for i := 5; i <= 6; i++ {
 		metric := ts[i]
 		assert.Equal(t, "gke_container", metric.Resource.Type)
 		assert.Equal(t, "container.googleapis.com/master/testcomponent/boolean_metric", metric.Metric.Type)
@@ -431,6 +642,61 @@ func TestTranslatePrometheusToStackdriver(t *testing.T) {
 			assert.Equal(t, false, *(metric.Points[0].Value.BoolValue))
 		} else if labels["labelName"] == "trueValue" {
 			assert.Equal(t, true, *(metric.Points[0].Value.BoolValue))
+		} else {
+			t.Errorf("Wrong label labelName value %s", labels["labelName"])
+		}
+	}
+}
+
+func TestTranslatePrometheusToStackdriverWithLabelFiltering(t *testing.T) {
+	cache := buildCacheForTesting()
+
+	whitelistedLabelsMap := map[string]map[string]bool{testLabelName: {testLabelValue1: true, testLabelValue2: true}}
+	commonConfigWithFiltering := &config.CommonConfig{
+		GceConfig: &config.GceConfig{
+			Project:  "test-proj",
+			Zone:     "us-central1-f",
+			Cluster:  "test-cluster",
+			Instance: "kubernetes-master.c.test-proj.internal",
+		},
+		SourceConfig: &config.SourceConfig{
+			PodConfig:            config.NewPodConfig("machine", "", "", "", ""),
+			Component:            "testcomponent",
+			MetricsPrefix:        "container.googleapis.com/master",
+			Whitelisted:          []string{testMetricName, testMetricHistogram, booleanMetricName, floatMetricName},
+			WhitelistedLabelsMap: whitelistedLabelsMap,
+		},
+	}
+
+	tsb := NewTimeSeriesBuilder(commonConfigWithFiltering, cache)
+	tsb.Update(metricsResponse, now)
+	ts, timestamp, err := tsb.Build()
+
+	assert.Equal(t, timestamp, now)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, 2, len(ts))
+
+	// TranslatePrometheusToStackdriver uses maps to represent data, so order of output is randomized.
+	sort.Sort(ByMetricTypeReversed(ts))
+
+	// First two int values.
+	for i := 0; i <= 1; i++ {
+		metric := ts[i]
+		assert.Equal(t, "gke_container", metric.Resource.Type)
+		assert.Equal(t, "container.googleapis.com/master/testcomponent/test_name", metric.Metric.Type)
+		assert.Equal(t, "INT64", metric.ValueType)
+		assert.Equal(t, "CUMULATIVE", metric.MetricKind)
+
+		assert.Equal(t, 1, len(metric.Points))
+		assert.Equal(t, "2009-02-13T23:31:30Z", metric.Points[0].Interval.StartTime)
+
+		labels := metric.Metric.Labels
+		assert.Equal(t, 1, len(labels))
+
+		if labels["labelName"] == "labelValue1" {
+			assert.Equal(t, int64(42), *(metric.Points[0].Value.Int64Value))
+		} else if labels["labelName"] == "labelValue2" {
+			assert.Equal(t, int64(106), *(metric.Points[0].Value.Int64Value))
 		} else {
 			t.Errorf("Wrong label labelName value %s", labels["labelName"])
 		}
@@ -594,7 +860,9 @@ int_summary_metric_count{label="l2"} 10
 
 			tsb := NewTimeSeriesBuilder(CommonConfigWithMetrics([]string{tt.summaryMetricName + "_sum", tt.summaryMetricName + "_count"}), cache)
 			tsb.Update(tt.prometheusResponse, end)
-			tss, err := tsb.Build()
+			tss, timestamp, err := tsb.Build()
+			assert.Equal(t, timestamp, end)
+
 			sort.Sort(ByMetricTypeReversed(tss))
 			if err != nil {
 				t.Errorf("Should not have an error parsing summary metric %v", err)
@@ -670,7 +938,7 @@ float_metric 123.17
 process_start_time_seconds 1234567890.0
 `,
 	}
-	tsb.Update(scrape, time.Now())
+	tsb.Update(scrape, now)
 	scrape = &PrometheusResponse{rawResponse: `
 # TYPE test_name counter
 test_name{labelName="labelValue1"} 42.0
@@ -679,9 +947,9 @@ test_name{labelName="labelValue2"} 601.0
 process_start_time_seconds 1234567890.0
 `,
 	}
-	tsb.Update(scrape, time.Now())
-	ts, err := tsb.Build()
-
+	tsb.Update(scrape, now)
+	ts, timestamp, err := tsb.Build()
+	assert.Equal(t, timestamp, now)
 	assert.Equal(t, err, nil)
 	assert.Equal(t, 2, len(ts))
 	// TranslatePrometheusToStackdriver uses maps to represent data, so order of output is randomized.
@@ -751,7 +1019,7 @@ func TestBuildWithoutUpdate(t *testing.T) {
 	cache := buildCacheForTesting()
 
 	tsb := NewTimeSeriesBuilder(CommonConfigWithMetrics([]string{testMetricName, testMetricHistogram, booleanMetricName, floatMetricName}), cache)
-	ts, err := tsb.Build()
+	ts, _, err := tsb.Build()
 
 	assert.Equal(t, err, nil)
 	assert.Equal(t, 0, len(ts))
@@ -770,6 +1038,8 @@ func buildCacheForTesting() *MetricDescriptorCache {
 	cache.descriptors[unrelatedMetric] = metricDescriptors[unrelatedMetric]
 	cache.descriptors[intSummaryMetricName+"_sum"] = metricDescriptors[intSummaryMetricName+"_sum"]
 	cache.descriptors[floatSummaryMetricName+"_sum"] = metricDescriptors[floatSummaryMetricName+"_sum"]
+	cache.descriptors[untypedMetricName] = metricDescriptors[untypedMetricName]
+
 	return cache
 }
 

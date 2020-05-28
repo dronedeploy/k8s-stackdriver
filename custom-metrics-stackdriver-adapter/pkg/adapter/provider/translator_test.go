@@ -23,8 +23,7 @@ import (
 	"time"
 
 	"github.com/GoogleCloudPlatform/k8s-stackdriver/custom-metrics-stackdriver-adapter/pkg/config"
-	"github.com/GoogleCloudPlatform/k8s-stackdriver/custom-metrics-stackdriver-adapter/pkg/provider"
-	"github.com/golang/glog"
+	"github.com/kubernetes-incubator/custom-metrics-apiserver/pkg/provider"
 	sd "google.golang.org/api/monitoring/v3"
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -34,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/klog"
 	"k8s.io/metrics/pkg/apis/custom_metrics"
 	"k8s.io/metrics/pkg/apis/external_metrics"
 )
@@ -61,7 +61,7 @@ func TestTranslator_GetSDReqForPods_Single(t *testing.T) {
 		},
 	}
 	metricName := "my/custom/metric"
-	request, err := translator.GetSDReqForPods(&v1.PodList{Items: []v1.Pod{pod}}, metricName, "GAUGE", "default")
+	request, err := translator.GetSDReqForPods(&v1.PodList{Items: []v1.Pod{pod}}, metricName, "GAUGE", labels.Everything(), "default")
 	if err != nil {
 		t.Errorf("Translation error: %s", err)
 	}
@@ -78,7 +78,59 @@ func TestTranslator_GetSDReqForPods_Single(t *testing.T) {
 		AggregationPerSeriesAligner("ALIGN_NEXT_OLDER").
 		AggregationAlignmentPeriod("120s")
 	if !reflect.DeepEqual(*request, *expectedRequest) {
-		t.Errorf("Unexpected result. Expected: \n%s,\n received: \n%s", expectedRequest, request)
+		t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", expectedRequest, request)
+	}
+}
+
+func TestTranslator_GetSDReqForPods_SingleWithMetricSelector(t *testing.T) {
+	translator, sdService :=
+		newFakeTranslator(2*time.Minute, time.Minute, "my-project", "my-cluster", "my-zone", time.Date(2017, 1, 2, 13, 2, 0, 0, time.UTC), true)
+	pod := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			ClusterName: "my-cluster",
+			UID:         "my-pod-id",
+			Name:        "my-pod-name",
+		},
+	}
+	metricName := "my/custom/metric"
+	metricSelector, _ := labels.Parse("metric.labels.custom=test")
+	request, err := translator.GetSDReqForPods(&v1.PodList{Items: []v1.Pod{pod}}, metricName, "GAUGE", metricSelector, "default")
+	if err != nil {
+		t.Errorf("Translation error: %s", err)
+	}
+	expectedRequest := sdService.Projects.TimeSeries.List("projects/my-project").
+		Filter("metric.labels.custom = \"test\" " +
+			"AND metric.type = \"my/custom/metric\" " +
+			"AND resource.labels.project_id = \"my-project\" " +
+			"AND resource.labels.cluster_name = \"my-cluster\" " +
+			"AND resource.labels.location = \"my-zone\" " +
+			"AND resource.labels.namespace_name = \"default\" " +
+			"AND resource.labels.pod_name = \"my-pod-name\" " +
+			"AND resource.type = \"k8s_pod\"").
+		IntervalStartTime("2017-01-02T13:00:00Z").
+		IntervalEndTime("2017-01-02T13:02:00Z").
+		AggregationPerSeriesAligner("ALIGN_NEXT_OLDER").
+		AggregationAlignmentPeriod("120s")
+	if !reflect.DeepEqual(*request, *expectedRequest) {
+		t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", expectedRequest, request)
+	}
+}
+
+func TestTranslator_GetSDReqForPods_SingleWithInvalidMetricSelector(t *testing.T) {
+	translator, _ :=
+		newFakeTranslator(2*time.Minute, time.Minute, "my-project", "my-cluster", "my-zone", time.Date(2017, 1, 2, 13, 2, 0, 0, time.UTC), true)
+	pod := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			ClusterName: "my-cluster",
+			UID:         "my-pod-id",
+			Name:        "my-pod-name",
+		},
+	}
+	metricName := "my/custom/metric"
+	metricSelector, _ := labels.Parse("resource.labels.type=container")
+	_, err := translator.GetSDReqForPods(&v1.PodList{Items: []v1.Pod{pod}}, metricName, "GAUGE", metricSelector, "default")
+	if err == nil {
+		t.Error("No translation error")
 	}
 }
 
@@ -100,7 +152,7 @@ func TestTranslator_GetSDReqForPods_Multiple(t *testing.T) {
 		},
 	}
 	metricName := "my/custom/metric"
-	request, err := translator.GetSDReqForPods(&v1.PodList{Items: []v1.Pod{pod1, pod2}}, metricName, "GAUGE", "default")
+	request, err := translator.GetSDReqForPods(&v1.PodList{Items: []v1.Pod{pod1, pod2}}, metricName, "GAUGE", labels.Everything(), "default")
 	if err != nil {
 		t.Fatalf("Translation error: %s", err)
 	}
@@ -117,7 +169,48 @@ func TestTranslator_GetSDReqForPods_Multiple(t *testing.T) {
 		AggregationPerSeriesAligner("ALIGN_NEXT_OLDER").
 		AggregationAlignmentPeriod("120s")
 	if !reflect.DeepEqual(*request, *expectedRequest) {
-		t.Errorf("Unexpected result. Expected: \n%s,\n received: \n%s", *expectedRequest, *request)
+		t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", *expectedRequest, *request)
+	}
+}
+
+func TestTranslator_GetSDReqForPods_MultipleWithMetricSelctor(t *testing.T) {
+	translator, sdService :=
+		newFakeTranslator(2*time.Minute, time.Minute, "my-project", "my-cluster", "my-zone", time.Date(2017, 1, 2, 13, 2, 0, 0, time.UTC), true)
+	pod1 := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			ClusterName: "my-cluster",
+			UID:         "my-pod-id-1",
+			Name:        "my-pod-name-1",
+		},
+	}
+	pod2 := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			ClusterName: "my-cluster",
+			UID:         "my-pod-id-2",
+			Name:        "my-pod-name-2",
+		},
+	}
+	metricName := "my/custom/metric"
+	metricSelector, _ := labels.Parse("metric.labels.custom=test")
+	request, err := translator.GetSDReqForPods(&v1.PodList{Items: []v1.Pod{pod1, pod2}}, metricName, "GAUGE", metricSelector, "default")
+	if err != nil {
+		t.Fatalf("Translation error: %s", err)
+	}
+	expectedRequest := sdService.Projects.TimeSeries.List("projects/my-project").
+		Filter("metric.labels.custom = \"test\" " +
+			"AND metric.type = \"my/custom/metric\" " +
+			"AND resource.labels.project_id = \"my-project\" " +
+			"AND resource.labels.cluster_name = \"my-cluster\" " +
+			"AND resource.labels.location = \"my-zone\" " +
+			"AND resource.labels.namespace_name = \"default\" " +
+			"AND resource.labels.pod_name = one_of(\"my-pod-name-1\",\"my-pod-name-2\") " +
+			"AND resource.type = \"k8s_pod\"").
+		IntervalStartTime("2017-01-02T13:00:00Z").
+		IntervalEndTime("2017-01-02T13:02:00Z").
+		AggregationPerSeriesAligner("ALIGN_NEXT_OLDER").
+		AggregationAlignmentPeriod("120s")
+	if !reflect.DeepEqual(*request, *expectedRequest) {
+		t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", *expectedRequest, *request)
 	}
 }
 
@@ -132,7 +225,7 @@ func TestTranslator_GetSDReqForNodes(t *testing.T) {
 		},
 	}
 	metricName := "my/custom/metric"
-	request, err := translator.GetSDReqForNodes(&v1.NodeList{Items: []v1.Node{node}}, metricName, "GAUGE")
+	request, err := translator.GetSDReqForNodes(&v1.NodeList{Items: []v1.Node{node}}, metricName, "GAUGE", labels.Everything())
 	if err != nil {
 		t.Errorf("Translation error: %s", err)
 	}
@@ -148,7 +241,40 @@ func TestTranslator_GetSDReqForNodes(t *testing.T) {
 		AggregationPerSeriesAligner("ALIGN_NEXT_OLDER").
 		AggregationAlignmentPeriod("120s")
 	if !reflect.DeepEqual(*request, *expectedRequest) {
-		t.Errorf("Unexpected result. Expected: \n%s,\n received: \n%s", *expectedRequest, *request)
+		t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", *expectedRequest, *request)
+	}
+}
+
+func TestTranslator_GetSDReqForNodes_withMetricSelector(t *testing.T) {
+	translator, sdService :=
+		newFakeTranslator(2*time.Minute, time.Minute, "my-project", "my-cluster", "my-zone", time.Date(2017, 1, 2, 13, 2, 0, 0, time.UTC), true)
+	node := v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			ClusterName: "my-cluster",
+			UID:         "my-node-id-1",
+			Name:        "my-node-name-1",
+		},
+	}
+	metricName := "my/custom/metric"
+	metricSelector, _ := labels.Parse("metric.labels.custom=test")
+	request, err := translator.GetSDReqForNodes(&v1.NodeList{Items: []v1.Node{node}}, metricName, "GAUGE", metricSelector)
+	if err != nil {
+		t.Errorf("Translation error: %s", err)
+	}
+	expectedRequest := sdService.Projects.TimeSeries.List("projects/my-project").
+		Filter("metric.labels.custom = \"test\" " +
+			"AND metric.type = \"my/custom/metric\" " +
+			"AND resource.labels.project_id = \"my-project\" " +
+			"AND resource.labels.cluster_name = \"my-cluster\" " +
+			"AND resource.labels.location = \"my-zone\" " +
+			"AND resource.labels.node_name = \"my-node-name-1\" " +
+			"AND resource.type = \"k8s_node\"").
+		IntervalStartTime("2017-01-02T13:00:00Z").
+		IntervalEndTime("2017-01-02T13:02:00Z").
+		AggregationPerSeriesAligner("ALIGN_NEXT_OLDER").
+		AggregationAlignmentPeriod("120s")
+	if !reflect.DeepEqual(*request, *expectedRequest) {
+		t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", *expectedRequest, *request)
 	}
 }
 
@@ -168,7 +294,7 @@ func TestTranslator_GetSDReqForPods_legacyResourceModel(t *testing.T) {
 		},
 	}
 	metricName := "my/custom/metric"
-	request, err := translator.GetSDReqForPods(&v1.PodList{Items: []v1.Pod{pod1, pod2}}, metricName, "GAUGE", "default")
+	request, err := translator.GetSDReqForPods(&v1.PodList{Items: []v1.Pod{pod1, pod2}}, metricName, "GAUGE", labels.Everything(), "default")
 	if err != nil {
 		t.Fatalf("Translation error: %s", err)
 	}
@@ -183,7 +309,7 @@ func TestTranslator_GetSDReqForPods_legacyResourceModel(t *testing.T) {
 		AggregationPerSeriesAligner("ALIGN_NEXT_OLDER").
 		AggregationAlignmentPeriod("120s")
 	if !reflect.DeepEqual(*request, *expectedRequest) {
-		t.Errorf("Unexpected result. Expected: \n%s,\n received: \n%s", *expectedRequest, *request)
+		t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", *expectedRequest, *request)
 	}
 }
 
@@ -223,16 +349,21 @@ func TestTranslator_GetRespForNodes_Aggregation(t *testing.T) {
 			UID:         "my-pod-id",
 		},
 	}
-	metrics, err := translator.GetRespForMultipleObjects(response, translator.getNodeItems(&v1.NodeList{Items: []v1.Node{node}}), schema.GroupResource{Resource: "Node"}, "my|custom|metric")
+	metricSelector, _ := labels.Parse("metric.labels.custom=test")
+	metrics, err := translator.GetRespForMultipleObjects(response, translator.getNodeItems(&v1.NodeList{Items: []v1.Node{node}}), schema.GroupResource{Resource: "Node"}, "my|custom|metric", metricSelector)
 	if err != nil {
 		t.Errorf("Translation error: %s", err)
 	}
+	expectedMetricSelector, _ := metav1.ParseToLabelSelector("metric.labels.custom=test")
 	expectedMetrics := []custom_metrics.MetricValue{
 		{
 			Value:           *resource.NewMilliQuantity(151000, resource.DecimalSI),
 			Timestamp:       metav1.Date(2017, 1, 2, 13, 2, 0, 0, time.UTC),
 			DescribedObject: custom_metrics.ObjectReference{Name: "my-node-name", APIVersion: "/__internal", Kind: "Node"},
-			MetricName:      "my|custom|metric",
+			Metric: custom_metrics.MetricIdentifier{
+				Name:     "my|custom|metric",
+				Selector: expectedMetricSelector,
+			},
 		},
 	}
 	if len(metrics) != len(expectedMetrics) {
@@ -240,7 +371,7 @@ func TestTranslator_GetRespForNodes_Aggregation(t *testing.T) {
 	}
 	for i := range metrics {
 		if !reflect.DeepEqual(metrics[i], expectedMetrics[i]) {
-			t.Errorf("Unexpected result. Expected: \n%s,\n received: \n%s", expectedMetrics[i], metrics[i])
+			t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", expectedMetrics[i], metrics[i])
 		}
 	}
 }
@@ -258,18 +389,23 @@ func TestTranslator_GetRespForPod_legacyResourceType(t *testing.T) {
 			Points:     []*sd.Point{{Interval: &sd.TimeInterval{StartTime: "2017-01-02T13:00:00Z", EndTime: "2017-01-02T13:02:00Z"}, Value: &sd.TypedValue{Int64Value: &metricValue}}},
 		}},
 	}
-	metric, err := translator.GetRespForSingleObject(response, schema.GroupResource{Resource: "Pod", Group: ""}, "my/custom/metric", "my-namespace", "my-pod-name")
+	metricSelector, _ := labels.Parse("metric.labels.custom=test")
+	metric, err := translator.GetRespForSingleObject(response, schema.GroupResource{Resource: "Pod", Group: ""}, "my/custom/metric", metricSelector, "my-namespace", "my-pod-name")
 	if err != nil {
 		t.Fatalf("Translation error: %s", err)
 	}
+	expectedMetricSelector, _ := metav1.ParseToLabelSelector("metric.labels.custom=test")
 	expectedMetric := &custom_metrics.MetricValue{
 		Value:           *resource.NewQuantity(151, resource.DecimalSI),
 		Timestamp:       metav1.Date(2017, 1, 2, 13, 2, 0, 0, time.UTC),
 		DescribedObject: custom_metrics.ObjectReference{Name: "my-pod-name", APIVersion: "/__internal", Kind: "Pod", Namespace: "my-namespace"},
-		MetricName:      "my/custom/metric",
+		Metric: custom_metrics.MetricIdentifier{
+			Name:     "my/custom/metric",
+			Selector: expectedMetricSelector,
+		},
 	}
 	if !reflect.DeepEqual(*metric, *expectedMetric) {
-		t.Errorf("Expected: \n%s,\n received: \n%s", expectedMetric, metric)
+		t.Errorf("Expected: \n%v,\n received: \n%v", expectedMetric, metric)
 	}
 }
 
@@ -294,16 +430,21 @@ func TestTranslator_GetRespForPods_legacyResourceType(t *testing.T) {
 			UID:         "my-pod-id",
 		},
 	}
-	metrics, err := translator.GetRespForMultipleObjects(response, translator.getPodItems(&v1.PodList{Items: []v1.Pod{pod}}), schema.GroupResource{Resource: "Pod"}, "my/custom/metric")
+	metricSelector, _ := labels.Parse("metric.labels.custom=test")
+	metrics, err := translator.GetRespForMultipleObjects(response, translator.getPodItems(&v1.PodList{Items: []v1.Pod{pod}}), schema.GroupResource{Resource: "Pod"}, "my/custom/metric", metricSelector)
 	if err != nil {
 		t.Fatalf("Translation error: %s", err)
 	}
+	expectedMetricSelector, _ := metav1.ParseToLabelSelector("metric.labels.custom=test")
 	expectedMetrics := []custom_metrics.MetricValue{
 		{
 			Value:           *resource.NewQuantity(151, resource.DecimalSI),
 			Timestamp:       metav1.Date(2017, 1, 2, 13, 2, 0, 0, time.UTC),
 			DescribedObject: custom_metrics.ObjectReference{Name: "my-pod-name", APIVersion: "/__internal", Kind: "Pod", Namespace: "my-namespace"},
-			MetricName:      "my/custom/metric",
+			Metric: custom_metrics.MetricIdentifier{
+				Name:     "my/custom/metric",
+				Selector: expectedMetricSelector,
+			},
 		},
 	}
 	if len(metrics) != len(expectedMetrics) {
@@ -311,7 +452,7 @@ func TestTranslator_GetRespForPods_legacyResourceType(t *testing.T) {
 	}
 	for i := range metrics {
 		if !reflect.DeepEqual(metrics[i], expectedMetrics[i]) {
-			t.Errorf("Unexpected result. Expected: \n%s,\n received: \n%s", expectedMetrics[i], metrics[i])
+			t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", expectedMetrics[i], metrics[i])
 		}
 	}
 }
@@ -341,16 +482,21 @@ func TestTranslator_GetRespForCustomMetric_MultiplePoints(t *testing.T) {
 			UID:         "my-pod-id",
 		},
 	}
-	metrics, err := translator.GetRespForMultipleObjects(response, translator.getPodItems(&v1.PodList{Items: []v1.Pod{pod}}), schema.GroupResource{Resource: "Pod"}, "my/custom/metric")
+	metricSelector, _ := labels.Parse("metric.labels.custom=test")
+	metrics, err := translator.GetRespForMultipleObjects(response, translator.getPodItems(&v1.PodList{Items: []v1.Pod{pod}}), schema.GroupResource{Resource: "Pod"}, "my/custom/metric", metricSelector)
 	if err != nil {
 		t.Fatalf("Translation error: %s", err)
 	}
+	expectedMetricSelector, _ := metav1.ParseToLabelSelector("metric.labels.custom=test")
 	expectedMetrics := []custom_metrics.MetricValue{
 		{
 			Value:           *resource.NewQuantity(151, resource.DecimalSI),
 			Timestamp:       metav1.Date(2017, 1, 2, 13, 2, 0, 0, time.UTC),
 			DescribedObject: custom_metrics.ObjectReference{Name: "my-pod-name", APIVersion: "/__internal", Kind: "Pod", Namespace: "my-namespace"},
-			MetricName:      "my/custom/metric",
+			Metric: custom_metrics.MetricIdentifier{
+				Name:     "my/custom/metric",
+				Selector: expectedMetricSelector,
+			},
 		},
 	}
 	if len(metrics) != len(expectedMetrics) {
@@ -358,7 +504,7 @@ func TestTranslator_GetRespForCustomMetric_MultiplePoints(t *testing.T) {
 	}
 	for i := range metrics {
 		if !reflect.DeepEqual(metrics[i], expectedMetrics[i]) {
-			t.Errorf("Unexpected result. Expected: \n%s,\n received: \n%s", expectedMetrics[i], metrics[i])
+			t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", expectedMetrics[i], metrics[i])
 		}
 	}
 }
@@ -373,7 +519,7 @@ func TestTranslator_ListMetricDescriptors(t *testing.T) {
 			"AND resource.labels.location = \"my-zone\" " +
 			"AND resource.type = one_of(\"k8s_pod\",\"k8s_node\")")
 	if !reflect.DeepEqual(*request, *expectedRequest) {
-		t.Errorf("Unexpected result. Expected: \n%s,\n received: \n%s", *expectedRequest, *request)
+		t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", *expectedRequest, *request)
 	}
 }
 
@@ -387,7 +533,7 @@ func TestTranslator_ListMetricDescriptors_legacyResourceType(t *testing.T) {
 			"AND resource.labels.container_name = \"\" AND resource.labels.pod_id != \"\" " +
 			"AND resource.labels.pod_id != \"machine\"")
 	if !reflect.DeepEqual(*request, *expectedRequest) {
-		t.Errorf("Unexpected result. Expected: \n%s,\n received: \n%s", *expectedRequest, *request)
+		t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", *expectedRequest, *request)
 	}
 }
 
@@ -416,7 +562,7 @@ func TestTranslator_GetMetricsFromSDDescriptorsResp(t *testing.T) {
 		{Metric: "custom.googleapis.com|q|p|s", GroupResource: schema.GroupResource{Group: "", Resource: "*"}, Namespaced: true},
 	}
 	if !reflect.DeepEqual(metricInfo, expectedMetricInfo) {
-		t.Errorf("Unexpected result. Expected: \n%s,\n received: \n%s", expectedMetricInfo, metricInfo)
+		t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", expectedMetricInfo, metricInfo)
 	}
 }
 
@@ -433,7 +579,7 @@ func TestTranslator_GetExternalMetricRequest_NoSelector(t *testing.T) {
 		AggregationPerSeriesAligner("ALIGN_NEXT_OLDER").
 		AggregationAlignmentPeriod("120s")
 	if !reflect.DeepEqual(*request, *expectedRequest) {
-		t.Errorf("Unexpected result. Expected \n%s,\n received: \n%s", *expectedRequest, *request)
+		t.Errorf("Unexpected result. Expected \n%v,\n received: \n%v", *expectedRequest, *request)
 	}
 }
 
@@ -460,7 +606,7 @@ func TestTranslator_GetExternalMetricRequest_CorrectSelector_Cumulative(t *testi
 		AggregationPerSeriesAligner("ALIGN_RATE").
 		AggregationAlignmentPeriod("60s")
 	if !reflect.DeepEqual(*request, *expectedRequest) {
-		t.Errorf("Unexpected result. Expected \n%s,\n received: \n%s", *expectedRequest, *request)
+		t.Errorf("Unexpected result. Expected \n%v,\n received: \n%v", *expectedRequest, *request)
 	}
 }
 
@@ -481,7 +627,7 @@ func TestTranslator_GetExternalMetricRequest_DifferentProject(t *testing.T) {
 		AggregationPerSeriesAligner("ALIGN_RATE").
 		AggregationAlignmentPeriod("60s")
 	if !reflect.DeepEqual(*request, *expectedRequest) {
-		t.Errorf("Unexpected result. Expected \n%s,\n received: \n%s", *expectedRequest, *request)
+		t.Errorf("Unexpected result. Expected \n%v,\n received: \n%v", *expectedRequest, *request)
 	}
 }
 
@@ -490,7 +636,7 @@ func TestTranslator_GetExternalMetricRequest_InvalidLabel(t *testing.T) {
 	_, err := translator.GetExternalMetricRequest("custom.googleapis.com/my/metric/name", "GAUGE", labels.SelectorFromSet(labels.Set{
 		"arbitrary-label": "foo",
 	}))
-	expectedError := provider.NewLabelNotAllowedError("arbitrary-label")
+	expectedError := NewLabelNotAllowedError("arbitrary-label")
 	if *err.(*errors.StatusError) != *expectedError {
 		t.Errorf("Expected status error: %s, but received: %s", expectedError, err)
 	}
@@ -538,11 +684,11 @@ func TestTranslator_GetRespForExternalMetric(t *testing.T) {
 		},
 	}
 	if len(metrics) != len(expectedMetrics) {
-		t.Errorf("Unexpected result. Expected %s metrics, received %s", len(expectedMetrics), len(metrics))
+		t.Errorf("Unexpected result. Expected %v metrics, received %v", len(expectedMetrics), len(metrics))
 	}
 	for i := range metrics {
 		if !reflect.DeepEqual(metrics[i], expectedMetrics[i]) {
-			t.Errorf("Unexpected result. Expected: \n%s,\n received: \n%s", expectedMetrics[i], metrics[i])
+			t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", expectedMetrics[i], metrics[i])
 		}
 	}
 }
@@ -580,11 +726,11 @@ func TestTranslator_GetRespForExternalMetric_MultiplePoints(t *testing.T) {
 		},
 	}
 	if len(metrics) != len(expectedMetrics) {
-		t.Errorf("Unexpected result. Expected %s metrics, received %s", len(expectedMetrics), len(metrics))
+		t.Errorf("Unexpected result. Expected %v metrics, received %v", len(expectedMetrics), len(metrics))
 	}
 	for i := range metrics {
 		if !reflect.DeepEqual(metrics[i], expectedMetrics[i]) {
-			t.Errorf("Unexpected result. Expected: \n%s,\n received: \n%s", expectedMetrics[i], metrics[i])
+			t.Errorf("Unexpected result. Expected: \n%v,\n received: \n%v", expectedMetrics[i], metrics[i])
 		}
 	}
 }
@@ -592,7 +738,7 @@ func TestTranslator_GetRespForExternalMetric_MultiplePoints(t *testing.T) {
 func newFakeTranslator(reqWindow, alignmentPeriod time.Duration, project, cluster, location string, currentTime time.Time, useNewResourceModel bool) (*Translator, *sd.Service) {
 	sdService, err := sd.New(http.DefaultClient)
 	if err != nil {
-		glog.Fatal("Unexpected error creating stackdriver Service client")
+		klog.Fatal("Unexpected error creating stackdriver Service client")
 	}
 	restMapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{})
 	restMapper.Add(v1.SchemeGroupVersion.WithKind("Pod"), meta.RESTScopeNamespace)
