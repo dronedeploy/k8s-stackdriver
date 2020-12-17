@@ -155,7 +155,11 @@ func main() {
 		}
 		glog.Infof("Created a client with the default credentials")
 	} else {
-		client = oauth2.NewClient(context.Background(), google.ComputeTokenSource(""))
+		ts, err := google.DefaultTokenSource(context.Background(), "")
+		if err != nil {
+			glog.Fatalf("Error creating default token source: %v", err)
+		}
+		client = oauth2.NewClient(context.Background(), ts)
 	}
 
 	stackdriverService, err := v3.New(client)
@@ -219,6 +223,9 @@ func readAndPushDataToStackdriver(stackdriverService *v3.Service, gceConf *confi
 		select {
 		case <-exportTicker:
 			ts, scrapeTimestamp, err := timeSeriesBuilder.Build()
+			// Mark cache as stale at the first export attempt after each refresh. Cache is considered refreshed only if after
+			// previous export there was successful call to Refresh function.
+			metricDescriptorCache.MarkStale()
 			if err != nil {
 				glog.Errorf("Could not build time series for component %v: %v", sourceConfig.Component, err)
 			} else {
@@ -227,9 +234,6 @@ func readAndPushDataToStackdriver(stackdriverService *v3.Service, gceConf *confi
 		default:
 		}
 
-		// Mark cache at the beginning of each iteration as stale. Cache is considered refreshed only if during
-		// current iteration there was successful call to Refresh function.
-		metricDescriptorCache.MarkStale()
 		glog.V(4).Infof("Scraping metrics of component %v", sourceConfig.Component)
 		select {
 		case <-signal:
